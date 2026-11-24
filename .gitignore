@@ -1,0 +1,33 @@
+# Entornos y secretos
+.env
+backend/.env
+frontend/.env
+*.env
+backend/credentials.json
+backend/gmail_token.json
+credentials.json
+gmail_token.json
+
+# Python / entorno virtual
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+
+# Node / Frontend (por si ya hay carpeta o al crearla)
+node_modules/
+dist/
+build/
+.vite/
+
+# Sistemas / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
