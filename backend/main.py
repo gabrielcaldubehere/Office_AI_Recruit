@@ -260,6 +260,7 @@ class OutreachListOut(BaseModel):
     operator: str
     count: int
     items: List[OutreachRecordOut]
+    reason: Optional[str] = None
 
 
 class OutreachStatusRequest(BaseModel):
@@ -898,14 +899,26 @@ def list_outreach_history(
     agent_id: Optional[str] = None,
     operator: Dict[str, Any] = Depends(require_operator),
 ) -> OutreachListOut:
-    if not db.outreach_available:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Falta aplicar la migración outreach_log en Supabase.",
+    operator_name = str(operator.get("sub") or "")
+    diagnostics = db.outreach_schema_status()
+    if not diagnostics["available"]:
+        return OutreachListOut(
+            operator=operator_name,
+            count=0,
+            items=[],
+            reason=str(diagnostics["message"]),
         )
-    records = db.list_outreach(status=status_filter, agent_id=agent_id)
+    try:
+        records = db.list_outreach(status=status_filter, agent_id=agent_id)
+    except Exception as exc:
+        return OutreachListOut(
+            operator=operator_name,
+            count=0,
+            items=[],
+            reason=f"No se pudo leer public.outreach_log: {exc}",
+        )
     return OutreachListOut(
-        operator=str(operator.get("sub") or ""),
+        operator=operator_name,
         count=len(records),
         items=[_outreach_out(record) for record in records],
     )
@@ -920,7 +933,7 @@ def update_outreach_status_endpoint(
     if not db.outreach_available:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Falta aplicar la migración outreach_log en Supabase.",
+            detail=str(db.outreach_schema_status()["message"]),
         )
     record = db.get_outreach_record(record_id)
     if not record:
@@ -948,7 +961,7 @@ def register_gmail_sent_action(
     if not db.outreach_available:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Falta aplicar la migración outreach_log en Supabase.",
+            detail=str(db.outreach_schema_status()["message"]),
         )
     record = db.get_outreach_record(payload.outreach_id)
     if not record:

@@ -149,18 +149,30 @@ export function runLucianoSessionApi(
   });
 }
 
-export function fetchOutreachRecords(
+export interface OutreachFeed {
+  items: OutreachRecord[];
+  reason?: string | null;
+}
+
+export function fetchOutreachFeed(
   token: string,
   filters: { status?: string; agent_id?: string } = {},
-): Promise<OutreachRecord[]> {
+): Promise<OutreachFeed> {
   const params = new URLSearchParams();
   if (filters.status) params.set("status", filters.status);
   if (filters.agent_id) params.set("agent_id", filters.agent_id);
   const query = params.toString();
-  return request<{ items: OutreachRecord[] }>(
+  return request<OutreachFeed>(
     `/api/outreach${query ? `?${query}` : ""}`,
     { headers: authHeaders(token) },
-  ).then((data) => data.items ?? []);
+  );
+}
+
+export function fetchOutreachRecords(
+  token: string,
+  filters: { status?: string; agent_id?: string } = {},
+): Promise<OutreachRecord[]> {
+  return fetchOutreachFeed(token, filters).then((data) => data.items ?? []);
 }
 
 export function updateOutreachStatusApi(

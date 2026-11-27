@@ -27,7 +27,7 @@ import {
   fetchAutomationStatus,
   fetchGmailStatus,
   fetchOperatorMe,
-  fetchOutreachRecords,
+  fetchOutreachFeed,
   fetchPendingDeliverables,
   fetchPublicOfficeSummary,
   loginOperator,
@@ -112,6 +112,7 @@ export default function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [deliverables, setDeliverables] = useState<DeliverableItem[]>([]);
   const [outreach, setOutreach] = useState<OutreachRecord[]>([]);
+  const [outreachReason, setOutreachReason] = useState<string | null>(null);
   const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(null);
   const [gmailUpdates, setGmailUpdates] = useState<GmailUpdate[]>([]);
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
@@ -140,7 +141,7 @@ export default function App() {
   const loadOperatorDeliverables = useCallback(async (authToken: string) => {
     const [deliverablesResult, outreachResult, gmailResult, automationResult] = await Promise.allSettled([
       fetchPendingDeliverables(authToken),
-      fetchOutreachRecords(authToken),
+      fetchOutreachFeed(authToken),
       fetchGmailStatus(authToken),
       fetchAutomationStatus(authToken),
     ]);
@@ -153,7 +154,10 @@ export default function App() {
       setOperatorName(null);
     }
     setDeliverables(deliverablesResult.status === "fulfilled" ? deliverablesResult.value : []);
-    setOutreach(outreachResult.status === "fulfilled" ? outreachResult.value : []);
+    setOutreach(outreachResult.status === "fulfilled" ? outreachResult.value.items ?? [] : []);
+    setOutreachReason(
+      outreachResult.status === "fulfilled" ? outreachResult.value.reason ?? null : null,
+    );
     setGmailStatus(gmailResult.status === "fulfilled" ? gmailResult.value : null);
     if (automationResult.status === "fulfilled") setAutomationStatus(automationResult.value.status);
   }, []);
@@ -251,6 +255,7 @@ export default function App() {
     setOperatorName(null);
     setDeliverables([]);
     setOutreach([]);
+    setOutreachReason(null);
     setGmailStatus(null);
     setGmailUpdates([]);
     setActivities({});
@@ -713,6 +718,7 @@ export default function App() {
             <OutreachPanel
               token={token}
               records={outreach}
+              schemaReason={outreachReason}
               gmailStatus={gmailStatus}
               gmailUpdates={gmailUpdates}
               onRefresh={() => void loadOperatorDeliverables(token)}

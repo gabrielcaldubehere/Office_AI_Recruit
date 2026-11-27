@@ -10,6 +10,37 @@ load_dotenv()
 
 _NOT_STATED = "No figura en la fuente"
 
+OUTREACH_TABLE = "outreach_log"
+OUTREACH_REQUIRED_COLUMNS = (
+    "id",
+    "agent_id",
+    "category",
+    "title",
+    "recipient",
+    "source_platform",
+    "source_url",
+    "source_url_of_application",
+    "company_or_client_name",
+    "contact_channel",
+    "contact_ref",
+    "contact_ref_pending",
+    "full_text",
+    "summary",
+    "cv_reference",
+    "attachment_reference",
+    "hourly_rate_usd",
+    "rate_model",
+    "status",
+    "gmail_message_id",
+    "gmail_thread_id",
+    "gmail_label",
+    "last_response_at",
+    "notes",
+    "operator",
+    "created_at",
+    "updated_at",
+)
+
 _CONTEXT_FIELDS = (
     "summary",
     "tailored_summary",
@@ -95,18 +126,83 @@ class DatabaseManager:
             raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
         self.supabase: Client = create_client(url, key)
         self.tz = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Argentina/Buenos_Aires"))
-        self._outreach_available: bool | None = None
+        self._outreach_schema: dict[str, Any] | None = None
+
+    def outreach_schema_status(self) -> dict[str, Any]:
+        if self._outreach_schema is not None:
+            return self._outreach_schema
+        result: dict[str, Any] = {
+            "available": False,
+            "table": f"public.{OUTREACH_TABLE}",
+            "missing_columns": [],
+            "error": "",
+            "message": "",
+        }
+        try:
+            self.supabase.table(OUTREACH_TABLE).select(
+                ",".join(OUTREACH_REQUIRED_COLUMNS)
+            ).limit(1).execute()
+            result["available"] = True
+            result["message"] = (
+                f"public.{OUTREACH_TABLE} disponible con todas las columnas del esquema OpenAPI."
+            )
+            self._outreach_schema = result
+            return result
+        except Exception as exc:
+            raw = str(exc)
+            lowered = raw.lower()
+            result["error"] = raw
+            table_missing = (
+                "pgrst205" in lowered
+                or ("could not find the" in lowered and "table" in lowered)
+                or ("relation" in lowered and "does not exist" in lowered)
+            )
+            column_missing = (
+                "pgrst204" in lowered
+                or "undefined column" in lowered
+                or ("could not find the" in lowered and "column" in lowered)
+                or ("column" in lowered and "does not exist" in lowered)
+            )
+            if table_missing:
+                result["message"] = (
+                    f"No existe public.{OUTREACH_TABLE} en Supabase. "
+                    "Aplicá backend/migrations/001_outreach_log.sql; si la tabla ya existía, "
+                    "aplicá también backend/migrations/002_outreach_log_columns.sql."
+                )
+            elif column_missing:
+                missing: list[str] = []
+                for column in OUTREACH_REQUIRED_COLUMNS:
+                    try:
+                        self.supabase.table(OUTREACH_TABLE).select(column).limit(1).execute()
+                    except Exception:
+                        missing.append(column)
+                result["missing_columns"] = missing
+                if missing:
+                    result["message"] = (
+                        f"Faltan columnas en public.{OUTREACH_TABLE}: {', '.join(missing)}. "
+                        "Aplicá backend/migrations/002_outreach_log_columns.sql."
+                    )
+                else:
+                    result["message"] = (
+                        f"El esquema de public.{OUTREACH_TABLE} no coincide con el OpenAPI: {raw}"
+                    )
+            elif "schema cache" in lowered:
+                result["message"] = (
+                    f"No se pudo verificar public.{OUTREACH_TABLE} por un error de caché de Supabase: {raw}"
+                )
+            elif any(token in lowered for token in ("permission denied", "401", "403", "jwt", "rls")):
+                result["message"] = (
+                    f"Supabase rechazó la lectura de public.{OUTREACH_TABLE}: {raw}. "
+                    "Verificá SUPABASE_SERVICE_ROLE_KEY y las policies de RLS."
+                )
+            else:
+                result["message"] = f"No se pudo verificar public.{OUTREACH_TABLE}: {raw}"
+        self._outreach_schema = result
+        return result
 
     @property
     def outreach_available(self) -> bool:
-        """Detecta una sola vez si la migración de outreach_log ya fue aplicada."""
-        if self._outreach_available is None:
-            try:
-                self.supabase.table("outreach_log").select("id").limit(1).execute()
-                self._outreach_available = True
-            except Exception:
-                self._outreach_available = False
-        return self._outreach_available
+        return bool(self.outreach_schema_status()["available"])
 
     def can_run_now(self) -> tuple[bool, str]:
         """Devuelve (puede_correr, motivo) según system_config."""
@@ -318,14 +414,14 @@ class DatabaseManager:
         payload.setdefault("contact_ref_pending", payload["contact_ref"] == _NOT_STATED)
         payload["created_at"] = datetime.now(self.tz).isoformat()
         payload["updated_at"] = payload["created_at"]
-        response = self.supabase.table("outreach_log").insert(payload).execute()
+        response = self.supabase.table(OUTREACH_TABLE).insert(payload).execute()
         return response.data[0] if response.data else payload
 
     def list_outreach(self, status: Optional[str] = None, agent_id: Optional[str] = None) -> list[dict[str, Any]]:
         """Historial de enviados y seguimiento, ordenado por fecha descendente."""
         if not self.outreach_available:
             return []
-        query = self.supabase.table("outreach_log").select("*")
+        query = self.supabase.table(OUTREACH_TABLE).select("*")
         if status:
             query = query.eq("status", status)
         if agent_id:
@@ -352,7 +448,7 @@ class DatabaseManager:
         if response_at:
             payload["last_response_at"] = response_at
         result = (
-            self.supabase.table("outreach_log")
+            self.supabase.table(OUTREACH_TABLE)
             .update(payload)
             .eq("id", record_id)
             .execute()
@@ -384,7 +480,7 @@ class DatabaseManager:
         if response_at:
             payload["last_response_at"] = response_at
         result = (
-            self.supabase.table("outreach_log")
+            self.supabase.table(OUTREACH_TABLE)
             .update(payload)
             .eq("id", record_id)
             .execute()
@@ -395,7 +491,7 @@ class DatabaseManager:
         if not self.outreach_available:
             return None
         result = (
-            self.supabase.table("outreach_log")
+            self.supabase.table(OUTREACH_TABLE)
             .select("*")
             .eq("id", record_id)
             .maybe_single()
@@ -407,7 +503,7 @@ class DatabaseManager:
         if not self.outreach_available:
             return None
         result = (
-            self.supabase.table("outreach_log")
+            self.supabase.table(OUTREACH_TABLE)
             .select("*")
             .eq("gmail_thread_id", thread_id)
             .limit(1)

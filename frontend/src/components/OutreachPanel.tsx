@@ -16,6 +16,7 @@ import type { GmailStatus, GmailSyncResult, GmailUpdate, OutreachRecord, Outreac
 interface OutreachPanelProps {
   token: string;
   records: OutreachRecord[];
+  schemaReason?: string | null;
   gmailStatus: GmailStatus | null;
   gmailUpdates: GmailUpdate[];
   onRefresh: () => void;
@@ -38,6 +39,7 @@ function labelOrMissing(value: string | null | undefined): string {
 export function OutreachPanel({
   token,
   records,
+  schemaReason,
   gmailStatus,
   gmailUpdates,
   onRefresh,
@@ -142,6 +144,13 @@ export function OutreachPanel({
           </button>
         </div>
       </div>
+
+      {schemaReason && (
+        <p className="mb-3 flex items-start gap-1.5 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{schemaReason}</span>
+        </p>
+      )}
 
       {gmailStatus?.reason && (
         <p className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
