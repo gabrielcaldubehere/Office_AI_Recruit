@@ -125,6 +125,7 @@ export interface FollowUpSummary {
   sent: number;
   awaiting_reply: number;
   responded: number;
+  novedades?: number;
   closed: number;
   total: number;
 }
@@ -259,6 +260,7 @@ export type OutreachStatus =
   | "enviado"
   | "espera_respuesta"
   | "respondido"
+  | "novedad_detectada"
   | "cerrado"
   | "pending_approval"
   | "approved"
@@ -281,6 +283,7 @@ export interface OutreachRecord {
   summary: string;
   cv_reference?: string | null;
   attachment_reference?: string | null;
+  draft_attachments?: Array<{ name: string; mime_type: string; size_bytes: number; path?: string }>;
   hourly_rate_usd?: number | null;
   rate_model?: string | null;
   status: OutreachStatus;
@@ -306,9 +309,23 @@ export interface GmailUpdate {
   gmail_label: string;
   subject: string;
   from: string;
+  from_address?: string;
   date: string;
   snippet: string;
   known_thread: boolean;
+  outreach_id?: string;
+  response_status?: "respondido" | "novedad_detectada";
+  alert_draft_id?: string;
+  suggested_action?: string;
+}
+
+export interface GmailDraftResult {
+  external_action: string;
+  draft_id: string;
+  to: string;
+  subject: string;
+  attachments: Array<{ name: string; mime_type: string; size_bytes: number }>;
+  reason?: string | null;
 }
 
 export interface GmailSyncResult {

@@ -25,9 +25,13 @@ El hash PBKDF2 se guarda en `OFFICE_ADMIN_PASSWORD_HASH` en `.env`. Sin sesión,
 
 ## Migración y Gmail
 
-- Ejecutá una vez `backend/migrations/001_outreach_log.sql` en el SQL Editor de Supabase. Hasta entonces, `/api/outreach` responde `503` y el historial queda vacío sin romper el resto de la oficina.
-- Las aprobaciones crean registros en `outreach_log` con `status = 'pending_approval'`; el operador pasa a `enviado` / `espera_respuesta` / `respondido` / `cerrado` manualmente.
-- Gmail queda inactivo hasta configurar `GMAIL_CREDENTIALS_PATH` y `GMAIL_TOKEN_PATH`. Sara solo lee/busca, aplica `Clientes` o `Postulaciones` y registra mensajes ya enviados; nunca borra, marca spam, cambia configuración ni responde automáticamente.
+- Ejecutá una vez `backend/migrations/001_outreach_log.sql` y `backend/migrations/002_outreach_log_columns.sql` en el SQL Editor de Supabase. Después aplicá `backend/migrations/003_gmail_control_status.sql` para habilitar `novedad_detectada` y reiniciá el backend (el esquema se cachea al arrancar).
+- Las aprobaciones crean registros en `outreach_log` con `status = 'pending_approval'`; el operador pasa a `enviado` / `espera_respuesta` / `respondido` / `novedad_detectada` / `cerrado` manualmente.
+- Gmail queda inactivo hasta configurar `GMAIL_CREDENTIALS_PATH` y `GMAIL_TOKEN_PATH` con `credentials.json` y `gmail_token.json` locales (nunca versionados). Para autorizar una vez, usá `GMAIL_ALLOW_INTERACTIVE_AUTH=true`, iniciá el backend, completá el flujo local y volvé a `false`.
+- scopes permitidos: lectura, etiquetas, modificación y creación de borradores. No hay scope `gmail.send`: Sara no envía correos. No borra, no marca spam, no cambia configuración y no responde automáticamente.
+- Los correos de control y los avisos de respuesta se preparan como borradores `pending_approval` dirigidos a `caldubeheregabriel@gmail.com` y etiquetados `Clientes` o `Postulaciones`. El botón "Crear borrador en Gmail" exige confirmación humana, crea un draft (nunca lo envía) y adjunta únicamente PDFs existentes y verificados.
+- Para PDFs, poné los archivos en rutas relativas al repo o configurá `GMAIL_PDF_DIR`. Referencias como `cv_reference` o `attachment_reference` solo se adjuntan si el PDF existe, es legible y pesa hasta 10 MB; si no existe, el correo lo indica expresamente.
+- `POST /api/gmail/sync` revisa mensajes entrantes de remitentes externos en `Clientes`/`Postulaciones`, vincula por `threadId`, marca `respondido` o `novedad_detectada`, y prepara el aviso de control.
 
 ## Scripts
 

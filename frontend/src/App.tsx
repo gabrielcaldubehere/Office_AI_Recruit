@@ -6,6 +6,7 @@ import {
   Clock3,
   Lock,
   LogOut,
+  MessageSquare,
   Pause,
   Play,
   RefreshCw,
@@ -123,6 +124,7 @@ export default function App() {
   const [notificationPermission, setNotificationPermission] =
     useState<NotificationPermission | "unsupported">("unsupported");
   const previousReportCount = useRef<number | null>(null);
+  const previousResponseCount = useRef<number | null>(null);
   const [automationStatus, setAutomationStatus] = useState<AutomationStatus | null>(null);
   const [automationBusy, setAutomationBusy] = useState<string | null>(null);
 
@@ -204,6 +206,8 @@ export default function App() {
   }, []);
 
   const reportsReady = summary?.daily_briefing.reports_ready ?? 0;
+  const responseCount =
+    (summary?.follow_up?.responded ?? 0) + (summary?.follow_up?.novedades ?? 0);
   useEffect(() => {
     const previous = previousReportCount.current;
     previousReportCount.current = reportsReady;
@@ -213,6 +217,16 @@ export default function App() {
       body: `Sara tiene ${reportsReady} reporte${reportsReady === 1 ? "" : "s"} listo${reportsReady === 1 ? "" : "s"} para revisión.`,
     });
   }, [reportsReady]);
+
+  useEffect(() => {
+    const previous = previousResponseCount.current;
+    previousResponseCount.current = responseCount;
+    if (previous === null || responseCount <= previous || typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    new Notification("AI Office · Gmail", {
+      body: `Sara detectó ${responseCount} respuesta(s)/novedad(es) en Gmail. Revisá Seguimiento.`,
+    });
+  }, [responseCount]);
 
   const requestNotifications = async () => {
     if (typeof Notification === "undefined") return;
@@ -273,6 +287,7 @@ export default function App() {
     if (!token) throw new Error("Iniciá sesión para revisar Gmail.");
     const result = await syncGmailResponses(token);
     setGmailUpdates(result.updates);
+    await loadPublicData(true);
     return result;
   };
 
@@ -457,6 +472,26 @@ export default function App() {
           </div>
         )}
 
+        {responseCount > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-xs text-sky-100">
+            <span className="inline-flex items-center gap-2">
+              <MessageSquare className="h-4 w-4" />
+              <strong>
+                Sara detectó {summary?.follow_up?.responded ?? 0} respuesta(s) y{" "}
+                {summary?.follow_up?.novedades ?? 0} novedad(es) en Gmail.
+              </strong>
+              Revisá el hilo y decidí la respuesta manualmente.
+            </span>
+            <button
+              type="button"
+              onClick={() => handleQuickAction("seguimiento")}
+              className="rounded-lg bg-sky-500/20 px-3 py-1.5 font-medium hover:bg-sky-500/30"
+            >
+              Ver respuestas
+            </button>
+          </div>
+        )}
+
         <section id="reportes" className="rounded-2xl border border-slate-800 bg-linear-to-r from-indigo-950/50 via-slate-900 to-slate-900 p-5 shadow-lg">
           <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
             <div className="flex items-start gap-4">
@@ -486,6 +521,11 @@ export default function App() {
                   {(summary?.follow_up?.responded ?? 0) > 0 && (
                     <span className="inline-flex items-center gap-1 rounded-lg bg-sky-500/10 px-2.5 py-1 text-sky-200">
                       Respondidos: <strong>{summary?.follow_up?.responded}</strong>
+                    </span>
+                  )}
+                  {(summary?.follow_up?.novedades ?? 0) > 0 && (
+                    <span className="inline-flex items-center gap-1 rounded-lg bg-sky-500/10 px-2.5 py-1 text-sky-200">
+                      Novedades: <strong>{summary?.follow_up?.novedades}</strong>
                     </span>
                   )}
                 </div>

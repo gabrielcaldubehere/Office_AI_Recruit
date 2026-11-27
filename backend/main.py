@@ -23,6 +23,7 @@ from agents.luciano import LucianoMentorAgent, MentorMode  # noqa: E402
 from agents.sara import SaraOrchestrator  # noqa: E402
 from automation import AutomationController  # noqa: E402
 from auth import create_session_token, verify_password  # noqa: E402
+import control_drafts  # noqa: E402
 from database import DatabaseManager  # noqa: E402
 from fetch_remote_jobs import fetch_remoteok_jobs, fetch_wwr_jobs  # noqa: E402
 from gmail_bridge import GmailBridge  # noqa: E402
@@ -154,6 +155,7 @@ class FollowUpSummaryOut(BaseModel):
     sent: int = 0
     awaiting_reply: int = 0
     responded: int = 0
+    novedades: int = 0
     closed: int = 0
     total: int = 0
 
@@ -244,6 +246,7 @@ class OutreachRecordOut(BaseModel):
     summary: str
     cv_reference: Optional[str] = None
     attachment_reference: Optional[str] = None
+    draft_attachments: List[Dict[str, Any]] = Field(default_factory=list)
     hourly_rate_usd: Optional[int] = None
     rate_model: Optional[str] = None
     status: str
@@ -268,6 +271,7 @@ class OutreachStatusRequest(BaseModel):
         "enviado",
         "espera_respuesta",
         "respondido",
+        "novedad_detectada",
         "cerrado",
         "pending_approval",
         "approved",
@@ -300,6 +304,20 @@ class GmailRegisterOut(BaseModel):
     gmail: Optional[Dict[str, str]] = None
     outreach: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+
+class GmailDraftRequest(BaseModel):
+    outreach_id: str = Field(min_length=1)
+    operator_confirmed: bool = Field(default=False)
+
+
+class GmailDraftOut(BaseModel):
+    external_action: str
+    draft_id: str = ""
+    to: str = ""
+    subject: str = ""
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    reason: Optional[str] = None
 
 
 class SourceCollectRequest(BaseModel):
@@ -423,6 +441,7 @@ def _outreach_out(record: Dict[str, Any]) -> OutreachRecordOut:
         summary=str(record.get("summary") or ""),
         cv_reference=record.get("cv_reference"),
         attachment_reference=record.get("attachment_reference"),
+        draft_attachments=control_drafts.attachments_from_record(record),
         hourly_rate_usd=record.get("hourly_rate_usd"),
         rate_model=record.get("rate_model"),
         status=str(record.get("status") or "pending_approval"),
@@ -497,12 +516,68 @@ def _build_outreach_record(item: Dict[str, Any], operator: str) -> Dict[str, Any
     }
 
 
+def _store_control_draft(spec: Dict[str, Any], action: str, details: str) -> Optional[Dict[str, Any]]:
+    try:
+        stored = control_drafts.store_control_draft(db, spec)
+        if not stored:
+            return None
+        db.log_execution(
+            agent_id="sara",
+            action=action,
+            status="success",
+            details=details[:1000],
+        )
+        return _outreach_out(stored)
+    except Exception as exc:
+        db.log_execution(
+            agent_id="sara",
+            action=action,
+            status="error",
+            details=str(exc)[:1000],
+        )
+        return None
+
+
+def _attach_batch_control_draft(
+    result: Dict[str, Any],
+    item_type: str,
+    items: List[Any],
+    operator: str,
+    age_filtered: int = 0,
+) -> None:
+    if not db.outreach_available:
+        return
+    platforms: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            platform = str(item.get("source_platform") or item.get("source") or "").strip()
+        else:
+            platform = str(getattr(item, "source_platform", "") or getattr(item, "source", "") or "").strip()
+        if platform and platform not in platforms:
+            platforms.append(platform)
+    spec = control_drafts.build_batch_control_spec(
+        item_type=item_type,
+        result=result,
+        age_filtered=age_filtered,
+        platforms=platforms,
+        operator=operator,
+    )
+    control = _store_control_draft(
+        spec,
+        "gmail_control_batch_prepared",
+        f"item_type={item_type} | agenda={control_drafts.ACCOUNT_EMAIL} | sin envío automático",
+    )
+    if control:
+        result["control_draft"] = control
+
+
 def _follow_up_summary() -> FollowUpSummaryOut:
     records = db.list_outreach()
     counts = {
         "enviado": 0,
         "espera_respuesta": 0,
         "respondido": 0,
+        "novedad_detectada": 0,
         "cerrado": 0,
     }
     for record in records:
@@ -513,6 +588,7 @@ def _follow_up_summary() -> FollowUpSummaryOut:
         sent=counts["enviado"],
         awaiting_reply=counts["espera_respuesta"],
         responded=counts["respondido"],
+        novedades=counts["novedad_detectada"],
         closed=counts["cerrado"],
         total=len(records),
     )
@@ -523,6 +599,7 @@ def _application_status(item: Dict[str, Any]) -> str:
         "enviado": "Enviado/registrado; falta confirmar respuesta",
         "espera_respuesta": "Postulado y en espera de respuesta",
         "respondido": "Respondido; Sara detectó novedades en Gmail",
+        "novedad_detectada": "Novedad detectada en un hilo sin registro previo; requiere revisión manual",
         "cerrado": "Cerrado",
         "pending_approval": "Pendiente de aprobación del operador",
         "approved": "Aprobado; pendiente de registro humano",
@@ -585,6 +662,11 @@ def _advisor_summary(jobs: List[Dict[str, Any]], clients: List[Dict[str, Any]]) 
         responded = db.list_outreach(status="respondido")
         if responded:
             suggestions.append(f"Hay {len(responded)} respuesta(s) en Gmail que requieren continuación humana.")
+        novedades = db.list_outreach(status="novedad_detectada")
+        if novedades:
+            suggestions.append(
+                f"Sara detectó {len(novedades)} novedad(es) en hilos sin registro previo; revisá Seguimiento."
+            )
     if not suggestions:
         suggestions.append("Sara no ve pendientes críticos: podés seguir en modo público o iniciar sesión para lanzar nuevas corridas.")
     return AdvisorOut(token_alert=token_alert, suggestions=suggestions[:5], findings=findings[:8])
@@ -619,6 +701,7 @@ def _auto_job_cycle() -> Dict[str, Any]:
         min_fit_score=int(os.getenv("AUTO_MIN_FIT_SCORE", "60")),
         max_items_per_batch=limit,
     )
+    _attach_batch_control_draft(result, "job", items, "automatización")
     return {"source": "automatic", "fetched": len(items), "result": result}
 
 
@@ -646,6 +729,7 @@ def _auto_client_cycle() -> Dict[str, Any]:
         min_fit_score=int(os.getenv("AUTO_MIN_FIT_SCORE", "60")),
         max_items_per_batch=limit,
     )
+    _attach_batch_control_draft(result, "client", items, "automatización")
     return {"source": "automatic", "fetched": len(items), "result": result}
 
 
@@ -805,6 +889,13 @@ def run_batch_evaluation(
             min_fit_score=payload.min_fit_score,
             max_items_per_batch=payload.max_items_per_batch,
         )
+        _attach_batch_control_draft(
+            result,
+            payload.item_type,
+            recent_items,
+            str(operator.get("sub") or ""),
+            age_filtered=len(raw_items) - len(recent_items),
+        )
         return BatchOut(
             operator=str(operator.get("sub") or ""),
             result=result,
@@ -848,6 +939,14 @@ def review_deliverable(
         record = db.add_outreach_record(_build_outreach_record(updated or item, operator_name))
         if record:
             execution_result["outreach_record"] = _outreach_out(record)
+            spec = control_drafts.build_approval_control_spec(updated or item, record, operator_name)
+            control = _store_control_draft(
+                spec,
+                "gmail_control_approval_prepared",
+                f"deliverable={deliverable_id} | agenda={control_drafts.ACCOUNT_EMAIL} | sin envío automático",
+            )
+            if control:
+                execution_result["control_draft"] = control
 
     pending = db.list_deliverables(status="pending_approval")
     db.set_agent_state(
@@ -971,6 +1070,45 @@ def register_gmail_sent_action(
     if fresh:
         result["outreach"] = _outreach_out(fresh)
     return GmailRegisterOut(**result)
+
+
+@app.post("/api/gmail/create-control-draft", response_model=GmailDraftOut)
+def create_gmail_control_draft(
+    payload: GmailDraftRequest,
+    operator: Dict[str, Any] = Depends(require_operator),
+) -> GmailDraftOut:
+    if not payload.operator_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Confirmá explícitamente la creación del borrador de control.",
+        )
+    if not gmail_bridge.status().get("enabled"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(gmail_bridge.status().get("reason") or "Gmail no disponible"),
+        )
+    if not db.outreach_available:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(db.outreach_schema_status()["message"]),
+        )
+    record = db.get_outreach_record(payload.outreach_id)
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Borrador de control no encontrado.")
+    try:
+        result = gmail_bridge.create_control_draft(record)
+        return GmailDraftOut(**result)
+    except Exception as exc:
+        db.log_execution(
+            agent_id="sara",
+            action="gmail_control_draft_created",
+            status="error",
+            details=str(exc)[:1000],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No se pudo crear el borrador: {exc}",
+        )
 
 
 @app.post("/api/sources/collect", response_model=SourceCollectOut)

@@ -7,6 +7,7 @@ export const STATUS_LABELS: Record<string, string> = {
   enviado: "Enviado",
   espera_respuesta: "En espera de respuesta",
   respondido: "Respondido",
+  novedad_detectada: "Novedad detectada",
   cerrado: "Cerrado",
   pending_approval: "Pendiente de aprobación",
   approved: "Aprobado",

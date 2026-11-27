@@ -7,9 +7,11 @@ import {
   ExternalLink,
   Mail,
   MessageSquare,
+  Paperclip,
+  PenLine,
   RefreshCw,
 } from "lucide-react";
-import { registerGmailSentAction, updateOutreachStatusApi } from "../services/api";
+import { createGmailControlDraft, registerGmailSentAction, updateOutreachStatusApi } from "../services/api";
 import { STATUS_LABELS } from "../lib/agentStatus";
 import type { GmailStatus, GmailSyncResult, GmailUpdate, OutreachRecord, OutreachStatus } from "../types/office";
 
@@ -29,11 +31,21 @@ const FILTERS: Array<{ value: string; label: string }> = [
   { value: "enviado", label: "Enviados" },
   { value: "espera_respuesta", label: "Espera de respuesta" },
   { value: "respondido", label: "Respondidos" },
+  { value: "novedad_detectada", label: "Novedades" },
+  { value: "pending_approval", label: "Pendientes de aprobación" },
   { value: "cerrado", label: "Cerrados" },
 ];
 
 function labelOrMissing(value: string | null | undefined): string {
   return value && value.trim() ? value : "No figura en la fuente";
+}
+
+function isControlDraft(record: OutreachRecord): boolean {
+  const notes = record.notes ?? "";
+  return (
+    record.recipient === "caldubeheregabriel@gmail.com" &&
+    (notes.includes("CORREO_CONTROL_OFICINA1") || notes.includes("ALERTA_RESPUESTA_GMAIL"))
+  );
 }
 
 export function OutreachPanel({
@@ -114,6 +126,27 @@ export function OutreachPanel({
     }
   };
 
+  const handleCreateDraft = async (record: OutreachRecord) => {
+    const confirmed = window.confirm(
+      `¿Crear un borrador en Gmail para ${record.recipient}? No se enviará nada automáticamente.`,
+    );
+    if (!confirmed) return;
+    setBusyId(record.id);
+    setError(null);
+    try {
+      const result = await createGmailControlDraft(token, record.id);
+      onNotice(
+        `Borrador creado (${result.draft_id || "id no informado"}) con ${
+          result.attachments?.length ?? 0
+        } adjunto(s). Revisá y enviá manualmente desde Gmail.`,
+      );
+    } catch (draftError) {
+      setError(draftError instanceof Error ? draftError.message : "No se pudo crear el borrador.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <section id="seguimiento" className="rounded-2xl border border-slate-800 bg-slate-900/80 p-5">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -166,8 +199,15 @@ export function OutreachPanel({
           </p>
           <ul className="mt-1 space-y-0.5">
             {gmailUpdates.slice(0, 5).map((update) => (
-              <li key={update.gmail_message_id} className="truncate">
-                [{update.gmail_label}] {update.from || "Remitente no informado"} — {update.subject || "Sin asunto"}
+              <li key={update.gmail_message_id} className="space-y-0.5">
+                <p className="truncate">
+                  [{update.gmail_label}] {update.from || "Remitente no informado"} — {update.subject || "Sin asunto"}
+                </p>
+                {update.suggested_action && (
+                  <p className="truncate pl-2 text-sky-200/70">
+                    {STATUS_LABELS[update.response_status ?? ""] ?? "Novedad"}: {update.suggested_action}
+                  </p>
+                )}
               </li>
             ))}
           </ul>
@@ -217,6 +257,27 @@ export function OutreachPanel({
                 </span>
               </div>
 
+              {isControlDraft(record) && (
+                <div className="mt-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 p-2.5 text-[11px] text-indigo-100">
+                  <p className="flex items-center gap-1.5 font-medium">
+                    <PenLine className="h-3.5 w-3.5" /> Borrador de correo de control para el dueño de la cuenta
+                  </p>
+                  <p className="mt-1 text-indigo-200/80">
+                    Preparado con trazabilidad real; pendiente de aprobación y sin envío automático.
+                  </p>
+                  {record.draft_attachments && record.draft_attachments.length > 0 && (
+                    <ul className="mt-1 space-y-0.5">
+                      {record.draft_attachments.map((attachment) => (
+                        <li key={attachment.name} className="flex items-center gap-1.5 truncate">
+                          <Paperclip className="h-3 w-3" />
+                          {attachment.name} · {attachment.mime_type} · {attachment.size_bytes} bytes
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
               <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
                 <span className="rounded-md bg-slate-800 px-2 py-0.5 text-slate-300">
                   Plataforma: {labelOrMissing(record.source_platform)}
@@ -257,7 +318,7 @@ export function OutreachPanel({
 
               <details className="mt-2 rounded-lg border border-slate-800 bg-slate-900/70 p-2.5">
                 <summary className="cursor-pointer text-[11px] font-medium text-slate-300">
-                  Texto preparado / enviado
+                  {isControlDraft(record) ? "Correo de control preparado (no enviado)" : "Texto preparado / enviado"}
                 </summary>
                 <p className="mt-2 whitespace-pre-line text-[11px] leading-relaxed text-slate-400">
                   {record.full_text || record.summary || "Sin texto cargado."}
@@ -283,7 +344,6 @@ export function OutreachPanel({
                       {option.label}
                     </option>
                   ))}
-                  <option value="pending_approval">Pendiente de aprobación</option>
                   <option value="approved">Aprobado</option>
                   <option value="rejected">Rechazado</option>
                 </select>
@@ -301,6 +361,16 @@ export function OutreachPanel({
                 >
                   <CheckCircle2 className="h-3.5 w-3.5" /> Registrar en Gmail
                 </button>
+                {isControlDraft(record) && (
+                  <button
+                    type="button"
+                    disabled={busyId === record.id}
+                    onClick={() => void handleCreateDraft(record)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-2.5 py-1.5 text-[11px] font-medium text-indigo-100 hover:bg-indigo-500/20 disabled:opacity-50"
+                  >
+                    <PenLine className="h-3.5 w-3.5" /> Crear borrador en Gmail
+                  </button>
+                )}
                 {record.status === "cerrado" && (
                   <span className="inline-flex items-center gap-1 text-[11px] text-slate-500">
                     <Archive className="h-3.5 w-3.5" /> Cerrado

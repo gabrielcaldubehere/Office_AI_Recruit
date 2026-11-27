@@ -406,7 +406,7 @@ class DatabaseManager:
         if not self.outreach_available:
             return None
         payload = dict(record)
-        payload.setdefault("status", "enviado")
+        payload.setdefault("status", "pending_approval")
         payload.setdefault("source_platform", "No figura en la fuente")
         payload.setdefault("company_or_client_name", _NOT_STATED)
         payload.setdefault("contact_channel", _NOT_STATED)

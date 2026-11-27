@@ -1,6 +1,7 @@
 import base64
 import os
 from email.message import EmailMessage
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,7 +14,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.labels",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
 ]
 ALLOWED_LABELS = ("Clientes", "Postulaciones")
 ACCOUNT_EMAIL = "caldubeheregabriel@gmail.com"
@@ -102,6 +103,18 @@ class GmailOrganizer:
             body={"addLabelIds": [labels[label_name]]},
         ).execute()
 
+    def apply_label_to_thread(self, thread_id: str, label_name: str) -> None:
+        if not thread_id:
+            return
+        if label_name not in ALLOWED_LABELS:
+            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
+        labels = self.ensure_labels()
+        self.service().users().threads().modify(
+            userId="me",
+            id=thread_id,
+            body={"addLabelIds": [labels[label_name]]},
+        ).execute()
+
     def list_label_messages(self, label_name: str, query: str = "") -> list[dict[str, Any]]:
         if label_name not in ALLOWED_LABELS:
             raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
@@ -131,7 +144,8 @@ class GmailOrganizer:
             h["Name"].lower(): h["Value"]
             for h in message.get("payload", {}).get("headers", [])
         }
-        thread_id = message.get("threadId")
+        thread_id = message.get("threadId") or ""
+        self.apply_label_to_thread(thread_id, label_name)
         return {
             "gmail_message_id": message_id,
             "gmail_thread_id": thread_id or "",
@@ -141,20 +155,48 @@ class GmailOrganizer:
             "to": headers.get("to", ""),
         }
 
-    def send_approved_email(self, to: str, subject: str, body: str, label_name: str) -> dict[str, str]:
-        if label_name not in ALLOWED_LABELS:
-            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
-        if not to or "@" not in to:
-            raise GmailAccessError("No hay correo de contacto verificado en la fuente; no se envía nada.")
+    def create_control_draft(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachments: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        if str(to).lower() != ACCOUNT_EMAIL:
+            raise GmailAccessError("Los borradores de control solo pueden dirigirse a la cuenta autorizada.")
         self.verify_account()
         message = EmailMessage()
         message["To"] = to
         message["From"] = ACCOUNT_EMAIL
-        message["Subject"] = subject
-        message.set_content(body)
+        message["Subject"] = subject[:250]
+        message.set_content(body[:30000])
+        attached: list[dict[str, Any]] = []
+        for item in attachments or []:
+            path = Path(str(item.get("path") or "")).expanduser()
+            if not path.is_file() or path.suffix.lower() != ".pdf":
+                continue
+            payload = path.read_bytes()
+            if not payload:
+                continue
+            message.add_attachment(
+                payload,
+                maintype="application",
+                subtype="pdf",
+                filename=path.name,
+            )
+            attached.append({"name": path.name, "mime_type": "application/pdf", "size_bytes": len(payload)})
         encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        sent = self.service().users().messages().send(userId="me", body={"raw": encoded}).execute()
-        return self.register_sent_action(sent.get("id", ""), label_name)
+        draft = self.service().users().drafts().create(
+            userId="me",
+            body={"message": {"raw": encoded}},
+        ).execute()
+        return {
+            "draft_id": str(draft.get("id") or ""),
+            "to": to,
+            "subject": subject[:250],
+            "attachments": attached,
+            "external_action": "draft_created",
+        }
 
     def detect_new_responses(
         self,
@@ -162,25 +204,32 @@ class GmailOrganizer:
         known_thread_ids: set[str],
     ) -> list[dict[str, Any]]:
         updates: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for label_name in ALLOWED_LABELS:
             for item in self.list_label_messages(label_name):
                 message_id = item.get("id")
-                thread_id = item.get("threadId")
-                if not message_id or message_id in known_message_ids:
+                thread_id = item.get("threadId") or ""
+                if not message_id or message_id in known_message_ids or message_id in seen:
                     continue
+                seen.add(message_id)
                 message = self.get_message(message_id)
                 headers = {
                     h["Name"].lower(): h["Value"]
                     for h in message.get("payload", {}).get("headers", [])
                 }
+                sender = headers.get("from", "")
+                sender_address = parseaddr(sender)[1].strip().lower()
+                if not sender_address or sender_address == ACCOUNT_EMAIL:
+                    continue
                 updates.append({
                     "gmail_message_id": message_id,
-                    "gmail_thread_id": thread_id or "",
+                    "gmail_thread_id": thread_id,
                     "gmail_label": label_name,
                     "subject": headers.get("subject", ""),
-                    "from": headers.get("from", ""),
+                    "from": sender,
+                    "from_address": sender_address,
                     "date": headers.get("date", ""),
-                    "snippet": message.get("snippet", "")[:300],
+                    "snippet": message.get("snippet", "")[:500],
                     "known_thread": bool(thread_id and thread_id in known_thread_ids),
                 })
         return updates

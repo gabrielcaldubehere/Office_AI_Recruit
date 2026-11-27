@@ -3,6 +3,7 @@ import type {
   BatchPayload,
   BatchResponse,
   DeliverableItem,
+  GmailDraftResult,
   GmailStatus,
   GmailSyncResult,
   LoginResponse,
@@ -210,6 +211,17 @@ export function registerGmailSentAction(
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(payload),
+  });
+}
+
+export function createGmailControlDraft(
+  token: string,
+  outreachId: string,
+): Promise<GmailDraftResult> {
+  return request<GmailDraftResult>("/api/gmail/create-control-draft", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ outreach_id: outreachId, operator_confirmed: true }),
   });
 }
 

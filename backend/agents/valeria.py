@@ -1,5 +1,5 @@
 import os
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,8 +45,8 @@ class ClientOpportunityEvaluation(BaseModel):
     fit_score: int = Field(ge=0, le=100)
     match_probability: int = Field(ge=0, le=100)
     complexity: Literal["baja", "media", "alta"] = "media"
-    recommended: bool
-    pain_points: list[str]
+    recommended: bool = False
+    pain_points: list[str] = Field(default_factory=list)
     proposed_solution: str
     match_arguments: list[str] = Field(default_factory=list)
     outreach_draft: str
@@ -63,8 +63,8 @@ class ClientOpportunityEvaluation(BaseModel):
     detailed_budget_note: str = (
         "En cuanto el cliente responda, se le enviará un presupuesto mucho más detallado."
     )
-    missing_info: list[str]
-    next_steps: list[str]
+    missing_info: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
 
 
 class ValeriaHunterAgent:
@@ -75,6 +75,28 @@ class ValeriaHunterAgent:
         self.router = router
         self.agent_id = "valeria"
         self.base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    @staticmethod
+    def _normalize_raw(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        data = dict(raw)
+
+        def as_string_list(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [value.strip()] if value.strip() else []
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            return []
+
+        for key in ("pain_points", "match_arguments", "missing_info", "next_steps"):
+            data[key] = as_string_list(data.get(key))
+        variants = data.get("outreach_variants")
+        data["outreach_variants"] = [item for item in variants if isinstance(item, dict)] if isinstance(variants, list) else []
+        for key in ("prospect_name", "company_or_client_name", "source_platform", "contact_channel", "contact_ref"):
+            value = data.get(key)
+            data[key] = value.strip() if isinstance(value, str) and value.strip() else NOT_STATED
+        return data
 
     def _load_catalog(self) -> str:
         path = os.path.join(self.base_dir, "context", "project_catalog.md")
@@ -111,9 +133,12 @@ needs_budget (boolean), hourly_rate_usd (integer or null), rate_justification (s
 estimated_hours_per_day (string like "2-3 h/día"), estimated_timeline (string like "1 semana"),
 delivery_modalities (array of 2 objects: "Entrega final del producto" and
 "Producto + mantenimiento mensual", each with model and description),
-preview_policy (string), detailed_budget_note (string), missing_info (array), next_steps (array).
+preview_policy (string), detailed_budget_note (string),
+missing_info (array of strings, REQUIRED; use [] if none),
+next_steps (array of strings, REQUIRED; use [] if none).
 
 Use Rioplatense Spanish for all user-facing strings.
+If there are no missing facts or next steps, return empty arrays; never invent them.
 MANDATORY content in every outreach_variant body:
 - complexity level, estimated hours per day and estimated timeline;
 - ONE competent hourly rate (35-55 USD) when a budget is requested, never a bargain or inflated;
@@ -145,7 +170,9 @@ Reference: {source_url}
                 temperature=0.2,
                 json_mode=True,
             )
-            parsed = ClientOpportunityEvaluation.model_validate(llm_response.get("json_data") or {})
+            parsed = ClientOpportunityEvaluation.model_validate(
+                self._normalize_raw(llm_response.get("json_data") or {})
+            )
             tokens_used = int(llm_response.get("tokens_used") or 0)
             evaluation = parsed.model_dump()
 
