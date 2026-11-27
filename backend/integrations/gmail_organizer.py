@@ -1,168 +1,186 @@
 import base64
 import os
-import re
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent
-CREDENTIALS_PATH = Path(os.getenv("GMAIL_CREDENTIALS_PATH", BACKEND_DIR / "credentials.json"))
-TOKEN_PATH = Path(os.getenv("GMAIL_TOKEN_PATH", BACKEND_DIR / "gmail_token.json"))
-
-# Permisos acotados: gestionar etiquetas, leer alertas y enviar solo borradores aprobados
 SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.labels",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
 ]
+ALLOWED_LABELS = ("Clientes", "Postulaciones")
+ACCOUNT_EMAIL = "caldubeheregabriel@gmail.com"
 
-# Jerarquía de carpetas (etiquetas anidadas en Gmail)
-DEFAULT_LABEL_TREE = [
-    "AI-Office",
-    "AI-Office/Empleos",
-    "AI-Office/Empleos/RemoteOK",
-    "AI-Office/Empleos/WeWorkRemotely",
-    "AI-Office/Empleos/GetOnBoard",
-    "AI-Office/Empleos/Himalayas",
-    "AI-Office/Clientes",
-    "AI-Office/Clientes/Workana",
-    "AI-Office/Clientes/Directos-PyMEs",
-]
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+CREDENTIALS_PATH = Path(os.getenv("GMAIL_CREDENTIALS_PATH", str(BACKEND_DIR / "credentials.json")))
+TOKEN_PATH = Path(os.getenv("GMAIL_TOKEN_PATH", str(BACKEND_DIR / "gmail_token.json")))
+
+
+class GmailAccessError(RuntimeError):
+    pass
 
 
 class GmailOrganizer:
-    """Gestiona etiquetas por portal/cliente, lectura de alertas y envíos aprobados vía OAuth2."""
+    def __init__(self, allow_interactive_auth: bool = False) -> None:
+        self._service: Any = None
+        self._labels: dict[str, str] = {}
+        self._allow_interactive_auth = allow_interactive_auth
 
-    def __init__(self) -> None:
-        self.service = self._authenticate()
-        self._label_cache: dict[str, str] = {}
+    @property
+    def enabled(self) -> bool:
+        return CREDENTIALS_PATH.exists() or TOKEN_PATH.exists()
 
-    def _authenticate(self):
+    def service(self) -> Any:
+        if self._service is not None:
+            return self._service
+        if not CREDENTIALS_PATH.exists() and not TOKEN_PATH.exists():
+            raise GmailAccessError(
+                "Gmail no configurado: definí GMAIL_CREDENTIALS_PATH y GMAIL_TOKEN_PATH con archivos locales."
+            )
         creds: Optional[Credentials] = None
         if TOKEN_PATH.exists():
             creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not CREDENTIALS_PATH.exists():
-                    raise FileNotFoundError(
-                        f"Falta {CREDENTIALS_PATH}. Descargá el JSON OAuth2 Desktop desde Google Cloud Console."
-                    )
-                flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
-                creds = flow.run_local_server(port=0)
-
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        elif not creds or not creds.valid:
+            if not CREDENTIALS_PATH.exists() or not self._allow_interactive_auth:
+                raise GmailAccessError(
+                    "Token Gmail ausente o vencido. Autorizá una vez de forma local con "
+                    "GMAIL_ALLOW_INTERACTIVE_AUTH=true y luego reiniciá el backend."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
+            creds = flow.run_local_server(port=0)
             TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+            os.chmod(TOKEN_PATH, 0o600)
+        self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        return self._service
 
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    def verify_account(self) -> str:
+        profile = self.service().users().getProfile(userId="me").execute()
+        email = str(profile.get("emailAddress") or "").lower()
+        if email != ACCOUNT_EMAIL:
+            raise GmailAccessError(
+                f"La cuenta autorizada ({email or 'desconocida'}) no es la permitida ({ACCOUNT_EMAIL})."
+            )
+        return email
 
-    def _refresh_label_cache(self) -> dict[str, str]:
-        resp = self.service.users().labels().list(userId="me").execute()
-        labels = resp.get("labels", [])
-        self._label_cache = {lbl["name"]: lbl["id"] for lbl in labels}
-        return self._label_cache
+    def ensure_labels(self) -> dict[str, str]:
+        service = self.service()
+        if self._labels:
+            return dict(self._labels)
+        existing = service.users().labels().list(userId="me").execute().get("labels", [])
+        for label in existing:
+            if label.get("name") in ALLOWED_LABELS:
+                self._labels[label["name"]] = label["id"]
+        for name in ALLOWED_LABELS:
+            if name not in self._labels:
+                created = service.users().labels().create(
+                    userId="me",
+                    body={
+                        "name": name,
+                        "labelListVisibility": "labelShow",
+                        "messageListVisibility": "show",
+                    },
+                ).execute()
+                self._labels[name] = created["id"]
+        return dict(self._labels)
 
-    def ensure_label_hierarchy(self, labels: list[str] = DEFAULT_LABEL_TREE) -> dict[str, str]:
-        """Crea la carpeta madre y todas las subcarpetas de Empleos y Clientes si no existen."""
-        existing = self._refresh_label_cache()
-        for label_name in labels:
-            if label_name in existing:
-                continue
-            body = {
-                "name": label_name,
-                "labelListVisibility": "labelShow",
-                "messageListVisibility": "show",
-            }
-            created = self.service.users().labels().create(userId="me", body=body).execute()
-            existing[label_name] = created["id"]
-        self._label_cache = existing
-        return existing
-
-    def resolve_label_name(self, category: str, source: str) -> str:
-        """Devuelve la ruta exacta, ej: 'AI-Office/Empleos/GetOnBoard' o 'AI-Office/Clientes/Workana'."""
-        clean_source = re.sub(r"[^a-zA-Z0-9_-]", "", source or "General") or "General"
-        root_branch = "Empleos" if category == "job_application" else "Clientes"
-        full_name = f"AI-Office/{root_branch}/{clean_source}"
-        if full_name not in self._label_cache:
-            self.ensure_label_hierarchy(["AI-Office", f"AI-Office/{root_branch}", full_name])
-        return full_name
-
-    def apply_label_to_message(self, message_id: str, label_name: str) -> None:
-        if label_name not in self._label_cache:
-            self.ensure_label_hierarchy([label_name])
-        label_id = self._label_cache[label_name]
-        self.service.users().messages().modify(
+    def apply_label(self, message_id: str, label_name: str) -> None:
+        if label_name not in ALLOWED_LABELS:
+            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
+        labels = self.ensure_labels()
+        self.service().users().messages().modify(
             userId="me",
             id=message_id,
-            body={"addLabelIds": [label_id]},
+            body={"addLabelIds": [labels[label_name]]},
         ).execute()
 
-    def fetch_alerts_from_label(self, label_name: str, max_results: int = 15) -> list[dict]:
-        """Lee mensajes no leídos dentro de una subcarpeta (ej: GetOnBoard o Workana) para pasarlos a Sara."""
-        if label_name not in self._label_cache:
-            self._refresh_label_cache()
-        label_id = self._label_cache.get(label_name)
-        if not label_id:
-            return []
+    def list_label_messages(self, label_name: str, query: str = "") -> list[dict[str, Any]]:
+        if label_name not in ALLOWED_LABELS:
+            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
+        labels = self.ensure_labels()
+        result = self.service().users().messages().list(
+            userId="me",
+            labelIds=[labels[label_name]],
+            q=query,
+            maxResults=50,
+        ).execute()
+        return result.get("messages", [])
 
-        res = (
-            self.service.users()
-            .messages()
-            .list(userId="me", labelIds=[label_id, "UNREAD"], maxResults=max_results)
-            .execute()
-        )
-        messages = res.get("messages", [])
-        extracted: list[dict] = []
+    def get_message(self, message_id: str) -> dict[str, Any]:
+        return self.service().users().messages().get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["Subject", "From", "To", "Date", "Message-ID"],
+        ).execute()
 
-        for msg_meta in messages:
-            msg = (
-                self.service.users()
-                .messages()
-                .get(userId="me", id=msg_meta["id"], format="full")
-                .execute()
-            )
-            headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
-            subject = headers.get("subject", "(Sin asunto)")
-            snippet = msg.get("snippet", "")
-            urls = re.findall(r"https?://[^\s<>\"']+", snippet)
+    def register_sent_action(self, message_id: str, label_name: str) -> dict[str, str]:
+        if label_name not in ALLOWED_LABELS:
+            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
+        self.apply_label(message_id, label_name)
+        message = self.get_message(message_id)
+        headers = {
+            h["Name"].lower(): h["Value"]
+            for h in message.get("payload", {}).get("headers", [])
+        }
+        thread_id = message.get("threadId")
+        return {
+            "gmail_message_id": message_id,
+            "gmail_thread_id": thread_id or "",
+            "gmail_label": label_name,
+            "subject": headers.get("subject", ""),
+            "from": headers.get("from", ""),
+            "to": headers.get("to", ""),
+        }
 
-            extracted.append({
-                "message_id": msg_meta["id"],
-                "subject": subject,
-                "snippet": snippet,
-                "detected_url": urls[0] if urls else f"gmail://{msg_meta['id']}",
-            })
-        return extracted
-
-    def send_approved_email(
-        self,
-        to_email: str,
-        subject: str,
-        body_text: str,
-        category: str,
-        source: str,
-    ) -> dict:
-        """Envía un correo solo tras aprobación humana y lo archiva bajo su etiqueta correspondiente."""
-        label_name = self.resolve_label_name(category=category, source=source)
-
+    def send_approved_email(self, to: str, subject: str, body: str, label_name: str) -> dict[str, str]:
+        if label_name not in ALLOWED_LABELS:
+            raise GmailAccessError(f"Etiqueta no permitida: {label_name}")
+        if not to or "@" not in to:
+            raise GmailAccessError("No hay correo de contacto verificado en la fuente; no se envía nada.")
+        self.verify_account()
         message = EmailMessage()
-        message["To"] = to_email
+        message["To"] = to
+        message["From"] = ACCOUNT_EMAIL
         message["Subject"] = subject
-        message.set_content(body_text)
+        message.set_content(body)
+        encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        sent = self.service().users().messages().send(userId="me", body={"raw": encoded}).execute()
+        return self.register_sent_action(sent.get("id", ""), label_name)
 
-        raw_encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-        sent = (
-            self.service.users()
-            .messages()
-            .send(userId="me", body={"raw": raw_encoded})
-            .execute()
-        )
-        self.apply_label_to_message(sent["id"], label_name)
-        return {"message_id": sent["id"], "label": label_name}
-    
+    def detect_new_responses(
+        self,
+        known_message_ids: set[str],
+        known_thread_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        updates: list[dict[str, Any]] = []
+        for label_name in ALLOWED_LABELS:
+            for item in self.list_label_messages(label_name):
+                message_id = item.get("id")
+                thread_id = item.get("threadId")
+                if not message_id or message_id in known_message_ids:
+                    continue
+                message = self.get_message(message_id)
+                headers = {
+                    h["Name"].lower(): h["Value"]
+                    for h in message.get("payload", {}).get("headers", [])
+                }
+                updates.append({
+                    "gmail_message_id": message_id,
+                    "gmail_thread_id": thread_id or "",
+                    "gmail_label": label_name,
+                    "subject": headers.get("subject", ""),
+                    "from": headers.get("from", ""),
+                    "date": headers.get("date", ""),
+                    "snippet": message.get("snippet", "")[:300],
+                    "known_thread": bool(thread_id and thread_id in known_thread_ids),
+                })
+        return updates

@@ -1,64 +1,95 @@
-import os  # Como `process` en Node.js: permite leer variables de entorno del sistema
-import json  # Como `JSON` en JS: convierte strings JSON a diccionarios de Python y viceversa
-from typing import Optional  # Como `string | null` en TypeScript: indica que un parámetro es opcional
-from dotenv import load_dotenv  # Carga el archivo .env en memoria (similar a `dotenv/config`)
-from openai import OpenAI  # Cliente oficial compatible con endpoints OpenAI-compatible
+import json
+import os
+import re
+from typing import Any, Callable, Optional
 
-# Cargamos las variables definidas en el archivo .env
+from dotenv import load_dotenv
+from openai import OpenAI
+
 load_dotenv()
 
 
+class LLMBudgetExceeded(RuntimeError):
+    pass
+
+
+class LLMResponseError(RuntimeError):
+    pass
+
+
+def _extract_json(content: str) -> Any:
+    if not content or not str(content).strip():
+        raise LLMResponseError("Respuesta vacía del proveedor")
+    text = str(content).strip()
+    lower = text.lower()
+    if lower.startswith("<!doctype") or lower.startswith("<html"):
+        raise LLMResponseError("Respuesta HTML en vez de JSON")
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    errors: list[str] = []
+    for match in re.finditer(r"[{[]", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+            return value
+        except json.JSONDecodeError as exc:
+            errors.append(str(exc))
+    raise LLMResponseError("Sin JSON válido: " + ("; ".join(errors[:2]) or "sin bloques interpretables"))
+
+
 class LLMRouter:
-    """
-    Enrutador multi-proveedor gratuito con fallback automático.
-    En TypeScript sería algo similar a una `class LLMRouter` con métodos `async ask(...)`.
-    """
-
-    def __init__(self) -> None:
-        # En Python, `__init__` es el equivalente al `constructor()` de una clase en TypeScript.
-        # `self` equivale a `this` en JavaScript/TypeScript.
+    def __init__(
+        self,
+        token_guard: Optional[Callable[[], tuple[bool, str]]] = None,
+        event_logger: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
         self.providers: list[dict[str, str]] = []
+        self.token_guard = token_guard
+        self.event_logger = event_logger
+        self._configure_providers()
 
-        # 1. Proveedor principal rápido (Groq): ideal para lotes de Mateo/Valeria/Elena
-        groq_key = os.getenv("GROQ_API_KEY")
-        if groq_key:
-            self.providers.append({
+    def _configure_providers(self) -> None:
+        configs = [
+            {
                 "name": "groq",
                 "base_url": "https://api.groq.com/openai/v1",
-                "api_key": groq_key,
+                "api_key": os.getenv("GROQ_API_KEY", ""),
                 "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            })
-
-        # 2. Proveedor de razonamiento / contexto amplio (Google Gemini via endpoint OpenAI)
-        gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-        if gemini_key:
-            self.providers.append({
+            },
+            {
                 "name": "gemini",
                 "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "api_key": gemini_key,
+                "api_key": (os.getenv("GEMINI_API_KEY") or "").strip(),
                 "model": (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip(),
-            })
-
-        # 3. Respaldo gratuito (OpenRouter): entra si fallan los anteriores o hay límite
-        openrouter_key = os.getenv("OPENROUTER_API_KEY")
-        if openrouter_key:
-            self.providers.append({
+            },
+            {
                 "name": "openrouter",
                 "base_url": "https://openrouter.ai/api/v1",
-                "api_key": openrouter_key,
+                "api_key": os.getenv("OPENROUTER_API_KEY", ""),
                 "model": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
-            })
+            },
+        ]
+        self.providers = [config for config in configs if config["api_key"]]
+
+    def _log_event(self, event: dict[str, Any]) -> None:
+        if not self.event_logger:
+            return
+        try:
+            self.event_logger(event)
+        except Exception:
+            pass
+
+    def _check_budget(self) -> None:
+        if not self.token_guard:
+            return
+        allowed, reason = self.token_guard()
+        if not allowed:
+            self._log_event({"provider": "budget", "status": "blocked", "details": reason})
+            raise LLMBudgetExceeded(reason)
 
     def load_skill(self, skill_filename: str) -> str:
-        """
-        Lee un archivo .md desde /skills/ solo cuando se necesita (Lazy Loading de Skill).
-        Ahorra tokens al no meter todas las reglas de todos los agentes en cada llamada.
-        """
-        # Construimos la ruta relativa desde backend/ hacia ../skills/<archivo>
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         skill_path = os.path.join(base_dir, "skills", skill_filename)
-
-        # `with open(...) as f:` abre y cierra el archivo de forma segura (evita fugas de memoria)
         with open(skill_path, "r", encoding="utf-8") as file:
             return file.read()
 
@@ -68,68 +99,62 @@ class LLMRouter:
         skill_file: Optional[str] = None,
         temperature: float = 0.2,
         json_mode: bool = False,
-    ) -> dict:
-        """
-        Envía el prompt al primer proveedor disponible.
-        Si ocurre un error (por ejemplo rate limit 429), prueba el siguiente proveedor.
-        """
+        max_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
         if not self.providers:
             raise RuntimeError("No hay API keys configuradas en .env (GROQ, GEMINI u OPENROUTER).")
+        system_instruction = self.load_skill(skill_file) if skill_file else ""
+        messages: list[dict[str, str]] = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+        errors: list[str] = []
 
-        # Combinamos las reglas de la Skill (si se pidió una) con el prompt de la tarea
-        system_instruction = ""
-        if skill_file:
-            system_instruction = self.load_skill(skill_file)
-
-        last_error: Optional[Exception] = None
-
-        # `for item in lista:` equivale a `for (const item of lista)` en TypeScript
         for provider in self.providers:
+            self._check_budget()
+            client = OpenAI(api_key=provider["api_key"], base_url=provider["base_url"], timeout=60.0)
+            request: dict[str, Any] = {
+                "model": provider["model"],
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if max_tokens:
+                request["max_tokens"] = max_tokens
             try:
-                client = OpenAI(
-                    api_key=provider["api_key"],
-                    base_url=provider["base_url"],
-                )
-
-                # Armamos los mensajes igual que en el chat completions de OpenAI/TS
-                messages = []
-                if system_instruction:
-                    messages.append({"role": "system", "content": system_instruction})
-                messages.append({"role": "user", "content": prompt})
-
-                # Parámetros extra si pedimos respuesta estricta en JSON
-                extra_params = {"response_format": {"type": "json_object"}} if json_mode else {}
-
-                response = client.chat.completions.create(
-                    model=provider["model"],
-                    messages=messages,
-                    temperature=temperature,
-                    **extra_params,  # `**` desempaqueta un diccionario como argumentos nombrados (como `...opts` en JS)
-                )
-
+                try:
+                    response = client.chat.completions.create(
+                        response_format={"type": "json_object"},
+                        **request,
+                    ) if json_mode else client.chat.completions.create(**request)
+                except TypeError as exc:
+                    if json_mode and "response_format" in str(exc).lower():
+                        response = client.chat.completions.create(**request)
+                    else:
+                        raise
                 content = response.choices[0].message.content or ""
-
-                # Estimación simple de tokens si el proveedor devuelve `usage`
-                tokens_used = 0
-                if response.usage and response.usage.total_tokens:
-                    tokens_used = response.usage.total_tokens
-
-                parsed_json = None
-                if json_mode:
-                    parsed_json = json.loads(content)
-
+                tokens_used = int(getattr(getattr(response, "usage", None), "total_tokens", 0) or 0)
+                parsed = _extract_json(content) if json_mode else None
+                self._log_event({
+                    "provider": provider["name"],
+                    "status": "success",
+                    "tokens": tokens_used,
+                    "details": f"model={provider['model']}",
+                })
                 return {
                     "provider": provider["name"],
                     "model": provider["model"],
                     "raw_text": content,
-                    "json_data": parsed_json,
+                    "json_data": parsed,
                     "tokens_used": tokens_used,
                 }
-
+            except LLMBudgetExceeded:
+                raise
             except Exception as exc:
-                # Guardamos el error y continuamos con el siguiente proveedor de la lista
-                last_error = exc
-                continue
-
-        # Si ningún proveedor respondió bien, lanzamos el último error ocurrido
-        raise RuntimeError(f"Todos los proveedores fallaron. Último error: {last_error}")
+                detail = f"{provider['name']}: {type(exc).__name__}: {exc}"
+                errors.append(detail)
+                self._log_event({
+                    "provider": provider["name"],
+                    "status": "error",
+                    "details": detail,
+                })
+        raise LLMResponseError("Todos los proveedores fallaron. " + " | ".join(errors))

@@ -21,6 +21,7 @@ for env_path in (BACKEND_DIR / ".env", ROOT_DIR / ".env"):
         load_dotenv(dotenv_path=env_path, override=False)
 
 from agents.sara import SaraOrchestrator  # noqa: E402
+from job_sources import age_check, collect_freelance_platforms  # noqa: E402
 
 
 REMOTEOK_API_URL = "https://remoteok.com/api"
@@ -86,6 +87,10 @@ def fetch_remoteok_jobs(limit: int = 15) -> list[dict]:
         tags_str = ", ".join(str(t) for t in tags if t)
         description = _clean_html(entry.get("description") or "")
         url = (entry.get("url") or entry.get("apply_url") or "").strip()
+        published_at = entry.get("date") or entry.get("epoch") or entry.get("created_at")
+        recent, _ = age_check({"published_at": published_at})
+        if not recent:
+            continue
         salary_min = entry.get("salary_min")
         salary_max = entry.get("salary_max")
 
@@ -109,6 +114,10 @@ def fetch_remoteok_jobs(limit: int = 15) -> list[dict]:
         job_url = url or f"https://remoteok.com/remote-jobs/{entry.get('id', len(collected) + 1)}"
         collected.append({
             "source": "RemoteOK",
+            "source_platform": "RemoteOK",
+            "title": position,
+            "company_or_client_name": company,
+            "published_at": published_at,
             "job_url": job_url,
             "raw_job_text": raw_job_text,
             "market": "GLOBAL_EN",
@@ -141,6 +150,10 @@ def fetch_wwr_jobs(limit_per_feed: int = 8) -> list[dict]:
                 link = (item.findtext("link") or "").strip()
                 region = (item.findtext("region") or "Remote").strip()
                 description = _clean_html(item.findtext("description") or "")
+                published_at = (item.findtext("pubDate") or "").strip()
+                recent, _ = age_check({"published_at": published_at})
+                if not recent:
+                    continue
 
                 if not title or not link or link in seen_links:
                     continue
@@ -158,6 +171,10 @@ def fetch_wwr_jobs(limit_per_feed: int = 8) -> list[dict]:
                 )
                 collected.append({
                     "source": source_name,
+                    "source_platform": source_name,
+                    "title": title,
+                    "company_or_client_name": (item.findtext("author") or "").strip() or "No figura en la fuente",
+                    "published_at": published_at,
                     "job_url": link,
                     "raw_job_text": raw_job_text,
                     "market": "GLOBAL_EN",
@@ -174,12 +191,21 @@ def fetch_wwr_jobs(limit_per_feed: int = 8) -> list[dict]:
 def run_collector(
     remoteok_limit: int = 12,
     wwr_limit_per_feed: int = 5,
+    marketplace_limit: int = 5,
     min_fit_score: int = 60,
     max_items_per_batch: int = 25,
     market: Literal["LATAM_ES", "GLOBAL_EN"] = "GLOBAL_EN",
 ) -> dict:
     sara = SaraOrchestrator()
-    jobs = fetch_remoteok_jobs(limit=remoteok_limit) + fetch_wwr_jobs(limit_per_feed=wwr_limit_per_feed)
+    jobs = (
+        fetch_remoteok_jobs(limit=remoteok_limit)
+        + fetch_wwr_jobs(limit_per_feed=wwr_limit_per_feed)
+        + collect_freelance_platforms(
+            upwork_limit=marketplace_limit,
+            freelancer_limit=marketplace_limit,
+            item_type="job",
+        )
+    )
 
     if not jobs:
         return {
@@ -209,6 +235,7 @@ if __name__ == "__main__":
     summary = run_collector(
         remoteok_limit=int(os.getenv("REMOTEOK_LIMIT", "12")),
         wwr_limit_per_feed=int(os.getenv("WWR_LIMIT_PER_FEED", "5")),
+        marketplace_limit=int(os.getenv("MARKETPLACE_LIMIT", "5")),
         min_fit_score=int(os.getenv("BATCH_MIN_FIT_SCORE", "60")),
         max_items_per_batch=int(os.getenv("BATCH_MAX_ITEMS", "25")),
         market="GLOBAL_EN",

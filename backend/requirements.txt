@@ -4,3 +4,7 @@ openai==1.61.1
 supabase==2.13.0
 python-dotenv==1.0.1
 pydantic==2.10.6
+google-api-python-client==2.202.0
+google-auth==2.63.1
+google-auth-oauthlib==1.5.0
+google-auth-httplib2==0.4.4

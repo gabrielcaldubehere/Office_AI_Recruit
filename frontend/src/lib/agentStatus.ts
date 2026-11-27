@@ -1,0 +1,14 @@
+export const STATUS_LABELS: Record<string, string> = {
+  working: "Trabajando",
+  terminando: "Terminando",
+  waiting_approval: "En espera de respuesta",
+  idle: "En espera / idle",
+  offline: "Sin conexión",
+  enviado: "Enviado",
+  espera_respuesta: "En espera de respuesta",
+  respondido: "Respondido",
+  cerrado: "Cerrado",
+  pending_approval: "Pendiente de aprobación",
+  approved: "Aprobado",
+  rejected: "Rechazado",
+};
